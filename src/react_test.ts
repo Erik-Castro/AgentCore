@@ -108,6 +108,31 @@ async function collect(gen: AsyncGenerator<AgentEvent, TExecutionResult, void>) 
   return { events, result: result as TExecutionResult };
 }
 
+function toolRoundNoUsage(name: string, args: string, callId = "call_1"): Ev[] {
+  return [
+    {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: callId, name, arguments: "", status: "in_progress" },
+      sequence_number: 1,
+    } as Ev,
+    { type: "response.function_call_arguments.delta", item_id: "fc_1", output_index: 0, delta: args, sequence_number: 2 } as Ev,
+    {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: callId, name, arguments: args, status: "completed" },
+      sequence_number: 3,
+    } as Ev,
+  ];
+}
+
+function textRoundNoUsage(text: string): Ev[] {
+  return [
+    { type: "response.output_text.delta", item_id: "m_1", output_index: 0, content_index: 0, delta: text, sequence_number: 1 } as Ev,
+    { type: "response.output_text.done", item_id: "m_1", output_index: 0, content_index: 0, text, sequence_number: 2 } as Ev,
+  ];
+}
+
 const uppercaseTool: Tool = {
   name: "uppercase",
   description: "Converte o texto para maiúsculas.",
@@ -709,4 +734,89 @@ Deno.test("HITL avançado: resume(false, params) ignora params e recusa", async 
     events.some((e) => e.type === "tool_result"),
     false,
   );
+});
+
+Deno.test("poda §B (tokens): uso real do provider dispara a condensação", async () => {
+  const summarized: Array<ResponseInputItemLike[]> = [];
+  let sawSummary = false;
+  const responses: ResponsesCall = async (request) => {
+    const first = request.input[0] as ResponseInputItemLike | undefined;
+    if (first?.role === "system") {
+      sawSummary = true;
+      assertEquals(String(first.content).includes("CONTEXTO RESUMIDO"), true);
+    }
+    return streamOf(toolRound("uppercase", '{"text":"oi"}'));
+  };
+  const summarizer: Summarizer = async ({ messages }) => {
+    summarized.push(messages as ResponseInputItemLike[]);
+    return "CONTEXTO RESUMIDO";
+  };
+  const agent = new ReAct(
+    { model: "model-x", system_prompt: "sys", maxRounds: 4 },
+    {
+      responses,
+      summarizer,
+      summarizeKeepRecent: 2,
+      maxContextTokens: 2, // budget 1.6 — o uso real (2) estoura
+      tokenEstimator: () => 0, // desliga o estimador: gatilho só via medição
+    },
+  );
+  agent.registryTool(uppercaseTool);
+
+  const { result } = await collect(agent.run("loop"));
+  assertEquals(sawSummary, true);
+  assertEquals(result.summaries >= 1, true);
+  assertEquals(summarized.length >= 1, true);
+});
+
+Deno.test("poda §B (tokens): sem usage da API, o estimador dispara o trigger", async () => {
+  let requestCount = 0;
+  const longText = "a".repeat(300);
+  const responses: ResponsesCall = async (request) => {
+    requestCount++;
+    if (requestCount === 1) {
+      return streamOf(
+        toolRoundNoUsage("uppercase", JSON.stringify({ text: longText })),
+      );
+    }
+    const first = request.input[0] as ResponseInputItemLike | undefined;
+    assertEquals(first?.role, "system");
+    assertEquals(first === undefined, false);
+    assertEquals(
+      String(first!.content).startsWith("Resumo do contexto anterior:"),
+      true,
+    );
+    return streamOf(textRoundNoUsage("fim"));
+  };
+  const summarizer: Summarizer = async () => "CONTEXTO RESUMIDO";
+  const agent = new ReAct(
+    { model: "model-x", system_prompt: "sys", maxRounds: 3 },
+    { responses, summarizer, summarizeKeepRecent: 2, maxContextTokens: 4 },
+  );
+  agent.registryTool(uppercaseTool);
+
+  const { result } = await collect(agent.run("loop"));
+  assertEquals(requestCount, 2);
+  assertEquals(result.summaries, 1);
+  assertEquals(result.rounds, 2);
+});
+
+Deno.test("poda §B (tokens): sem maxContextTokens o trigger fica desligado", async () => {
+  let summarizerCalls = 0;
+  const responses: ResponsesCall = async () =>
+    streamOf(toolRound("uppercase", '{"text":"oi"}'));
+  const summarizer: Summarizer = async () => {
+    summarizerCalls++;
+    return "X";
+  };
+  const agent = new ReAct(
+    { model: "model-x", system_prompt: "sys", maxRounds: 3 },
+    { responses, summarizer, summarizeKeepRecent: 2, tokenEstimator: () => 1_000_000 },
+  );
+  agent.registryTool(uppercaseTool);
+
+  const { result } = await collect(agent.run("loop"));
+  assertEquals(summarizerCalls, 0);
+  assertEquals(result.summaries, 0);
+  assertEquals(result.toolCalls, 3);
 });

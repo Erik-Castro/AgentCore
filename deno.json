@@ -1,10 +1,16 @@
 {
+  "name": "agentcore",
+  "version": "0.1.0",
+  "exports": {
+    ".": "./mod.ts"
+  },
   "tasks": {
     "dev": "deno run --allow-net --allow-env --watch main.ts",
-    "check": "deno check main.ts src/mod.ts",
+    "check": "deno check main.ts mod.ts src/mod.ts",
     "test": "deno test"
   },
   "imports": {
-    "openai": "npm:openai@^7.15.0"
+    "openai": "npm:openai@^7.15.0",
+    "agentcore": "./mod.ts"
   }
 }

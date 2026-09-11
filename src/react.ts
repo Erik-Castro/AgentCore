@@ -56,6 +56,7 @@ import type {
 } from "./types.ts";
 import { mapResponseStream, type RoundOutcome } from "./events.ts";
 import { ToolRegistry, toOpenAITool } from "./tools.ts";
+import { estimateTokens, type TokenEstimator } from "./tokens.ts";
 import type { Summarizer } from "./summarizer.ts";
 import { createClient } from "./client.ts";
 import { loadRuntimeConfig } from "./config.ts";
@@ -64,6 +65,7 @@ const DEFAULT_MAX_ROUNDS = 6;
 const DEFAULT_MAX_CONTEXT_ITEMS = 40;
 const DEFAULT_MAX_CONTEXT_CHARS = 120_000;
 const DEFAULT_SUMMARIZE_KEEP_RECENT = 6;
+const DEFAULT_CONTEXT_TOKEN_RATIO = 0.8;
 
 /**
  * Requisição de um único round ao provider (modelo de baixo nível).
@@ -165,6 +167,30 @@ export interface ReActOptions {
   /** Máx. de caracteres do JSON do histórico (§B). Default: 120_000. */
   maxContextChars?: number;
   /**
+   * Janela de contexto do modelo em tokens (§B). `0` (default) = desligado.
+   *
+   * Ao configurar, o harness dispara a poda/sumarização quando a medição de
+   * tokens do contexto ultrapassa `contextTokenRatio` desta janela. A medição
+   * usa o `usage.input_tokens` real do round anterior (mais preciso) e, sem
+   * esse dado, cai na estimativa de {@link estimateTokens} (ou num
+   * `tokenEstimator` injetado).
+   *
+   * @example `maxContextTokens: 32_768` para uma janela de 32k do modelo.
+   */
+  maxContextTokens?: number;
+  /**
+   * Fração da janela usada como gatilho de condensação (§B). Default: `0.8`
+   * (80% — valor da suggests.md). Clampado em `(0.01, 1]`.
+   *
+   * @example `contextTokenRatio: 0.9` condensa só perto do estouro real.
+   */
+  contextTokenRatio?: number;
+  /**
+   * Medidor de tokens injetável (§B). Default: {@link estimateTokens}
+   * (~4 chars/token). Use para plugar um tokenizador real.
+   */
+  tokenEstimator?: TokenEstimator;
+  /**
    * Condensa o histórico antigo por LLM (§B). Opt-in: sem ele, a poda
    * determinística (splice + limite por chars) é a única ativa.
    *
@@ -232,11 +258,16 @@ export class ReAct {
   private readonly _responses: ResponsesCall;
   private readonly _maxContextItems: number;
   private readonly _maxContextChars: number;
+  private readonly _maxContextTokens: number;
+  private readonly _contextTokenRatio: number;
+  private readonly _tokenEstimator: TokenEstimator;
   private readonly _summarizer?: Summarizer;
   private readonly _summarizeKeepRecent: number;
   private readonly _approvalTimeoutMs: number;
   private _summaries = 0;
   private _ac: AbortController | null = null;
+  /** Uso real de entrada do último round (null antes do 1º round / sem usage). */
+  private _lastInputTokens: number | null = null;
   private _state: "idle" | "running" | "paused" = "idle";
   private _pendingApproval: {
     call_id: string;
@@ -278,6 +309,12 @@ export class ReAct {
       defaultResponsesCall(options.client ?? createClient(loadRuntimeConfig()));
     this._maxContextItems = options.maxContextItems ?? DEFAULT_MAX_CONTEXT_ITEMS;
     this._maxContextChars = options.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS;
+    this._maxContextTokens = options.maxContextTokens ?? 0;
+    this._contextTokenRatio = Math.min(
+      1,
+      Math.max(options.contextTokenRatio ?? DEFAULT_CONTEXT_TOKEN_RATIO, 0.01),
+    );
+    this._tokenEstimator = options.tokenEstimator ?? estimateTokens;
     this._summarizer = options.summarizer;
     this._summarizeKeepRecent = options.summarizeKeepRecent ??
       DEFAULT_SUMMARIZE_KEEP_RECENT;
@@ -464,6 +501,7 @@ export class ReAct {
     this._rounds = 0;
     this._callings = 0;
     this._summaries = 0;
+    this._lastInputTokens = null;
   }
 
   private toUserItem(prompt: string): Responses.ResponseInputItem {
@@ -484,6 +522,20 @@ export class ReAct {
     }
   }
 
+  /** Projeção de tokens do contexto: uso real do último round, senão estimativa. */
+  private contextTokens(): number {
+    const measured = this._lastInputTokens;
+    if (measured !== null) return measured;
+    return this._tokenEstimator(JSON.stringify(this._messages));
+  }
+
+  /** Trigger por tokens (§B): contexto acima de `ratio` da janela do modelo. */
+  private overTokens(): boolean {
+    if (this._maxContextTokens <= 0) return false;
+    const budget = this._maxContextTokens * this._contextTokenRatio;
+    return this.contextTokens() > budget;
+  }
+
   /**
    * Gestão de contexto (§B): com `summarizer` configurado, o prefixo antigo
    * (tudo antes das últimas `summarizeKeepRecent` mensagens) é condensado em um
@@ -494,7 +546,8 @@ export class ReAct {
     const overChars =
       this._maxContextChars > 0 &&
       JSON.stringify(this._messages).length > this._maxContextChars;
-    if (!overItems && !overChars) return;
+    const overTokens = this.overTokens();
+    if (!overItems && !overChars && !overTokens) return;
 
     const keepFrom = this._messages.length - this._summarizeKeepRecent;
     if (this._summarizer && keepFrom > 0) {
@@ -563,6 +616,7 @@ export class ReAct {
     let finalContent = "";
     this._rounds = 0;
     this._ac = new AbortController();
+    this._lastInputTokens = null;
     const signal = this._ac.signal;
     this._state = "running";
     this._pendingApproval = null;
@@ -628,6 +682,9 @@ export class ReAct {
           inputTokens += outcome.usage.inputTokens;
           outputTokens += outcome.usage.outputTokens;
           totalTokens += outcome.usage.totalTokens;
+          this._lastInputTokens = outcome.usage.inputTokens;
+        } else {
+          this._lastInputTokens = null;
         }
         if (outcome.aborted) {
           yield { type: "aborted" };
