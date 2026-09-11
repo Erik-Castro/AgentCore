@@ -89,7 +89,8 @@ export interface ToolCall {
  * `content.done` são marcadores de fim (spec §4 pensava em `thinking.end`/
  * `content.end` emitindo `\n` — agora é decisão do consumidor).
  * `tool_interrupt` (HITL §D): o agente aguarda `resume(true|false)` antes de
- * executar uma tool sensível; `tool_denied` sinaliza a recusa do usuário.
+ * executar uma tool sensível; `tool_denied` sinaliza a recusa do usuário
+ * (`reason: "timeout"` quando `approvalTimeoutMs` esgotar sem decisão).
  */
 export type AgentEvent =
   | { type: "reasoning"; token: string }
@@ -99,6 +100,6 @@ export type AgentEvent =
   | { type: "tool_call"; tool: string; args: string }
   | { type: "tool_result"; tool: string; ok: boolean; output: string }
   | { type: "tool_interrupt"; tool: string; args: string; call_id: string }
-  | { type: "tool_denied"; tool: string; args: string }
+  | { type: "tool_denied"; tool: string; args: string; reason: "user" | "timeout" }
   | { type: "error"; error: unknown }
   | { type: "aborted" };

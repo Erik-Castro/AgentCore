@@ -378,6 +378,7 @@ Deno.test("HITL: tool sensível recusada via resume(false) não executa", async 
     type: "tool_denied",
     tool: "sensitive_upper",
     args: '{"text":"oi"}',
+    reason: "user",
   });
   assertEquals(events.filter((e) => e.type === "tool_result").length, 0);
   assertEquals(result!.toolCalls, 0);
@@ -563,4 +564,149 @@ Deno.test("poda §B: cancel() durante a sumarização encerra sem deadlock", asy
   assertEquals(cancelled, true);
   assertEquals(result !== undefined, true);
   assertEquals(agent.state, "idle");
+});
+Deno.test("HITL avançado: resume(true, params) executa o override revalidado", async () => {
+  let requestCount = 0;
+  const responses: ResponsesCall = async (request) => {
+    requestCount++;
+    if (requestCount === 1) return streamOf(toolRound("sensitive_upper", '{"text":"oi"}'));
+    const outputs = request.input.filter(
+      (item) => (item as { type?: string }).type === "function_call_output",
+    );
+    assertEquals(outputs.length, 1);
+    assertEquals((outputs[0] as { output?: string }).output, "OVERRIDE");
+    const systems = request.input.filter(
+      (item) => (item as { role?: string }).role === "system",
+    );
+    assertEquals(
+      systems.some((s) =>
+        String((s as { content?: unknown }).content).includes("ajustados pelo usuário")
+      ),
+      true,
+    );
+    return streamOf(textRound("ok"));
+  };
+  const agent = new ReAct(
+    { model: "model-x", system_prompt: "sys", maxRounds: 6 },
+    { responses },
+  );
+  agent.registryTool(sensitiveTool);
+
+  const generator = agent.run("x");
+  const events: AgentEvent[] = [];
+  let result: TExecutionResult;
+  for (;;) {
+    const { value, done } = await generator.next();
+    if (done) {
+      result = value;
+      break;
+    }
+    if (value.type === "tool_interrupt") agent.resume(true, { text: "override" });
+    events.push(value);
+  }
+  assertEquals(events.find((e) => e.type === "tool_result"), {
+    type: "tool_result",
+    tool: "sensitive_upper",
+    ok: true,
+    output: "OVERRIDE",
+  });
+  assertEquals(result!.toolCalls, 1);
+  assertEquals(result!.rounds, 2);
+});
+
+Deno.test("HITL avançado: override inválido vira self-healing", async () => {
+  let requestCount = 0;
+  const responses: ResponsesCall = async (request) => {
+    requestCount++;
+    if (requestCount === 1) return streamOf(toolRound("sensitive_upper", '{"text":"oi"}'));
+    const systems = request.input.filter(
+      (item) => (item as { role?: string }).role === "system",
+    );
+    assertEquals(
+      systems.some((s) =>
+        String((s as { content?: unknown }).content).includes("Erro na ferramenta")
+      ),
+      true,
+    );
+    return streamOf(textRound("corrigido"));
+  };
+  const agent = new ReAct(
+    { model: "model-x", system_prompt: "sys", maxRounds: 6 },
+    { responses },
+  );
+  agent.registryTool(sensitiveTool);
+
+  const generator = agent.run("x");
+  const events: AgentEvent[] = [];
+  let result: TExecutionResult;
+  for (;;) {
+    const { value, done } = await generator.next();
+    if (done) {
+      result = value;
+      break;
+    }
+    if (value.type === "tool_interrupt") agent.resume(true, { text: 123 });
+    events.push(value);
+  }
+  const toolResult = events.find((e) => e.type === "tool_result");
+  assertEquals(toolResult !== undefined, true);
+  assertEquals(toolResult!.ok, false);
+  assertEquals(result!.rounds, 2);
+  assertEquals(result!.content.content, "corrigido");
+});
+
+Deno.test("HITL avançado: approvalTimeoutMs auto-recusa sem decisão", async () => {
+  let requestCount = 0;
+  const responses: ResponsesCall = async () => {
+    requestCount++;
+    if (requestCount === 1) return streamOf(toolRound("sensitive_upper", '{"text":"oi"}'));
+    return streamOf(textRound("final"));
+  };
+  const agent = new ReAct(
+    { model: "model-x", system_prompt: "sys", maxRounds: 6 },
+    { responses, approvalTimeoutMs: 5 },
+  );
+  agent.registryTool(sensitiveTool);
+
+  const { events, result } = await collect(agent.run("x"));
+  const denied = events.find((e) => e.type === "tool_denied");
+  assertEquals(denied, {
+    type: "tool_denied",
+    tool: "sensitive_upper",
+    args: '{"text":"oi"}',
+    reason: "timeout",
+  });
+  assertEquals(events.filter((e) => e.type === "tool_interrupt").length, 1);
+  assertEquals(result.toolCalls, 0);
+  assertEquals(result.rounds, 2);
+  assertEquals(result.content.content, "final");
+  assertEquals(agent.state, "idle");
+});
+
+Deno.test("HITL avançado: resume(false, params) ignora params e recusa", async () => {
+  const responses: ResponsesCall = async () => streamOf(toolRound("sensitive_upper", '{"text":"oi"}'));
+  const agent = new ReAct(
+    { model: "model-x", system_prompt: "sys", maxRounds: 3 },
+    { responses, approvalTimeoutMs: 200 },
+  );
+  agent.registryTool(sensitiveTool);
+
+  const generator = agent.run("x");
+  const events: AgentEvent[] = [];
+  for (;;) {
+    const { value, done } = await generator.next();
+    if (done) break;
+    events.push(value);
+    if (value.type === "tool_interrupt") agent.resume(false, { text: "substituir" });
+  }
+  assertEquals(events.find((e) => e.type === "tool_denied"), {
+    type: "tool_denied",
+    tool: "sensitive_upper",
+    args: '{"text":"oi"}',
+    reason: "user",
+  });
+  assertEquals(
+    events.some((e) => e.type === "tool_result"),
+    false,
+  );
 });

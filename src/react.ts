@@ -80,6 +80,12 @@ export interface ReActOptions {
   summarizer?: Summarizer;
   /** Quantos itens finais do histórico ficam intactos na sumarização (§B). */
   summarizeKeepRecent?: number;
+  /**
+   * Tempo máximo (ms) para a decisão HITL (§D). `0` (default) = sem limite.
+   * Ao vencer sem `resume()`, a tool é auto-recusada (`tool_denied` com
+   * `reason: "timeout"`), evitando deadlock quando o consumidor some.
+   */
+  approvalTimeoutMs?: number;
 }
 
 /**
@@ -100,17 +106,18 @@ export class ReAct {
   private readonly _maxContextChars: number;
   private readonly _summarizer?: Summarizer;
   private readonly _summarizeKeepRecent: number;
+  private readonly _approvalTimeoutMs: number;
   private _summaries = 0;
   private _ac: AbortController | null = null;
   private _state: "idle" | "running" | "paused" = "idle";
   private _pendingApproval: {
     call_id: string;
-    resolve: (approved: boolean) => void;
+    resolve: (approved: boolean, params?: Record<string, unknown>) => void;
   } | null = null;
 
   private get pendingApproval(): {
     call_id: string;
-    resolve: (approved: boolean) => void;
+    resolve: (approved: boolean, params?: Record<string, unknown>) => void;
   } | null {
     return this._pendingApproval;
   }
@@ -133,6 +140,7 @@ export class ReAct {
     this._summarizer = options.summarizer;
     this._summarizeKeepRecent = options.summarizeKeepRecent ??
       DEFAULT_SUMMARIZE_KEEP_RECENT;
+    this._approvalTimeoutMs = options.approvalTimeoutMs ?? 0;
   }
 
   // ---- Event listeners (spec §5) -----------------------------------------
@@ -175,16 +183,18 @@ export class ReAct {
 
   /**
    * HITL (suggests.md §D): decide a aprovação pendente emitida via
-   * `tool_interrupt`. `true` executa a tool sensível; `false` injeta a recusa
-   * do usuário no contexto e emite `tool_denied`.
+   * `tool_interrupt`. `true` executa a tool sensível — com `params`, executa
+   * com os parâmetros ajustados pelo usuário (override, revalidado pelo
+   * `executeSafe`). `false` injeta a recusa do usuário no contexto e emite
+   * `tool_denied` (params são ignorados na recusa).
    */
-  public resume(approved: boolean): void {
+  public resume(approved: boolean, params?: Record<string, unknown>): void {
     if (!this._pendingApproval) {
       throw new Error("resume() sem tool_interrupt pendente.");
     }
     const { resolve } = this._pendingApproval;
     this._pendingApproval = null;
-    resolve(approved);
+    resolve(approved, params);
     if (this._state === "paused") this._state = "running";
   }
 
@@ -363,16 +373,38 @@ export class ReAct {
           if (tool?.sensitive) {
             // HITL (§D): pausa e aguarda decisão humana via resume().
             this._state = "paused";
-            const approval = new Promise<boolean>((resolve) => {
-              this._pendingApproval = { call_id: call.call_id, resolve };
+            let timedOut = false;
+            let resolveApproval!: (
+              decision: { approved: boolean; params?: Record<string, unknown> },
+            ) => void;
+            const approval = new Promise<{
+              approved: boolean;
+              params?: Record<string, unknown>;
+            }>((resolve) => {
+              resolveApproval = resolve;
             });
+            this._pendingApproval = {
+              call_id: call.call_id,
+              resolve: (approved, params) => resolveApproval({ approved, params }),
+            };
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            if (this._approvalTimeoutMs > 0) {
+              timer = setTimeout(() => {
+                if (this._pendingApproval) {
+                  this._pendingApproval = null;
+                  timedOut = true;
+                  resolveApproval({ approved: false });
+                }
+              }, this._approvalTimeoutMs);
+            }
             yield {
               type: "tool_interrupt",
               tool: call.name,
               args: call.args,
               call_id: call.call_id,
             };
-            const approved = await approval;
+            const { approved, params } = await approval;
+            if (timer !== undefined) clearTimeout(timer);
             if (signal.aborted) {
               yield { type: "aborted" };
               return finish();
@@ -386,8 +418,24 @@ export class ReAct {
                 call_id: call.call_id,
                 output,
               });
-              yield { type: "tool_denied", tool: call.name, args: call.args };
+              yield {
+                type: "tool_denied",
+                tool: call.name,
+                args: call.args,
+                reason: timedOut ? "timeout" : "user",
+              };
               continue;
+            }
+
+            if (params) {
+              // Override (§D avançado): o modelo precisa saber que os args mudaram.
+              call.args = JSON.stringify(params);
+              this._messages.push({
+                role: "system",
+                content:
+                  `A ferramenta "${call.name}" foi aprovada com parâmetros ` +
+                  "ajustados pelo usuário.",
+              });
             }
           }
 

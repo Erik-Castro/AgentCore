@@ -29,7 +29,7 @@ A `src/` é uma implementação funcional da spec que valida as propostas:
 - **`ReAct.run(prompt)`** é um *async generator*: emite `AgentEvent` em tempo real (raciocínio, conteúdo, chamadas de tool) e retorna `TExecutionResult` (uso de tokens, tempo, rounds, calls).
 - **Self-healing (§C)**: falha de tool (JSON inválido, schema violado, tool desconhecida) nunca quebra o agente — o erro volta ao contexto como mensagem de sistema e o modelo tenta de novo.
 - **Gestão de contexto (§B)**: limites determinísticos de itens/caracteres impedem contexto infinito; **opt-in** para condensar o histórico antigo por LLM (`ReActOptions.summarizer`) mantendo as últimas interações intactas, com a poda determinística como *safety net*.
-- **HITL (§D)**: tools marcadas `sensitive: true` pausam o agente (`state === "paused"`) emitindo `tool_interrupt`; a decisão chega via `resume(true|false)`.
+- **HITL (§D)**: tools marcadas `sensitive: true` pausam o agente (`state === "paused"`) emitindo `tool_interrupt`; a decisão chega via `resume(true|false)`. Com `approvalTimeoutMs` configurado, a decisão expira sozinha (`tool_denied` com `reason: "timeout"`) — consumidor sumido não trava o agente. `resume(true, params)` aprova com parâmetros ajustados (override revalidado pelo schema).
 - **`cancel()`** (AbortController) e **`reset()`** para lifecycle gracioso.
 - **Provider injetável**: os testes rodam 100% offline com um provider fake, sem rede.
 
@@ -58,10 +58,20 @@ for await (const event of agent.run("Qual a hora agora?")) {
 Com HITL (aprovação humana):
 
 ```ts
+const agent = new ReAct(
+  { model: "qwen3:4b", system_prompt: "...", maxRounds: 6 },
+  { approvalTimeoutMs: 30_000 }, // sem resposta, auto-recusa (§D avançado)
+);
+
 for await (const event of agent.run("Apague o registro 42")) {
   if (event.type === "tool_interrupt") {
     const ok = confirm(`Permitir ${event.tool}(${event.args})?`);
-    agent.resume(ok);
+    if (ok) {
+      const alvo = prompt("Alvo alterado? (Enter mantém)") ?? "";
+      agent.resume(true, alvo ? { target: alvo } : undefined); // override
+    } else {
+      agent.resume(false);
+    }
   }
 }
 ```
@@ -82,7 +92,7 @@ const agent = new ReAct(
 ```bash
 deno task dev     # demo interativa contra o Ollama local (main.ts)
 deno task check   # typecheck de main.ts + src/mod.ts
-deno task test    # suíte offline (33 testes): eventos, tools, loop ReAct e summarizer
+deno task test    # suíte offline (37 testes): eventos, tools, loop ReAct e summarizer
 ```
 
 Defaults sem env: `OPENAI_BASE_URL=http://localhost:11434/v1`, `OPENAI_API_KEY=ollama`, retries 5.
@@ -90,7 +100,6 @@ Defaults sem env: `OPENAI_BASE_URL=http://localhost:11434/v1`, `OPENAI_API_KEY=o
 ## Roadmap (próximas fases)
 
 - **Trigger por tokens reais**: hoje a poda usa itens/caracteres como proxy (não há tokenizador offline)
-- **HITL avançado**: override de parâmetros na aprovação, timeout de decisão
 - **Validação com Zod** (hoje a validação é manual)
 - **Testes de integração** com Ollama local de ponta a ponta
 
