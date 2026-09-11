@@ -1,0 +1,10 @@
+{
+  "tasks": {
+    "dev": "deno run --allow-net --allow-env --watch main.ts",
+    "check": "deno check main.ts src/mod.ts",
+    "test": "deno test"
+  },
+  "imports": {
+    "openai": "npm:openai@^7.15.0"
+  }
+}
