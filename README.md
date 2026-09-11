@@ -28,7 +28,7 @@ A `src/` é uma implementação funcional da spec que valida as propostas:
 
 - **`ReAct.run(prompt)`** é um *async generator*: emite `AgentEvent` em tempo real (raciocínio, conteúdo, chamadas de tool) e retorna `TExecutionResult` (uso de tokens, tempo, rounds, calls).
 - **Self-healing (§C)**: falha de tool (JSON inválido, schema violado, tool desconhecida) nunca quebra o agente — o erro volta ao contexto como mensagem de sistema e o modelo tenta de novo.
-- **Poda de contexto (§B reducida)**: limites determinísticos de itens/caracteres impedem contexto infinito (sumarização por LLM fica para a próxima fase).
+- **Gestão de contexto (§B)**: limites determinísticos de itens/caracteres impedem contexto infinito; **opt-in** para condensar o histórico antigo por LLM (`ReActOptions.summarizer`) mantendo as últimas interações intactas, com a poda determinística como *safety net*.
 - **HITL (§D)**: tools marcadas `sensitive: true` pausam o agente (`state === "paused"`) emitindo `tool_interrupt`; a decisão chega via `resume(true|false)`.
 - **`cancel()`** (AbortController) e **`reset()`** para lifecycle gracioso.
 - **Provider injetável**: os testes rodam 100% offline com um provider fake, sem rede.
@@ -66,19 +66,30 @@ for await (const event of agent.run("Apague o registro 42")) {
 }
 ```
 
+Com poda de contexto por LLM (opt-in):
+
+```ts
+import { ReAct, createLLMSummarizer } from "./src/mod.ts";
+
+const agent = new ReAct(
+  { model: "qwen3:4b", system_prompt: "...", maxRounds: 8 },
+  { summarizer: createLLMSummarizer(responses) }, // condensa o histórico antigo (§B)
+);
+```
+
 ## Como rodar
 
 ```bash
 deno task dev     # demo interativa contra o Ollama local (main.ts)
 deno task check   # typecheck de main.ts + src/mod.ts
-deno task test    # suíte offline (27 testes): eventos, tools e loop ReAct
+deno task test    # suíte offline (33 testes): eventos, tools, loop ReAct e summarizer
 ```
 
 Defaults sem env: `OPENAI_BASE_URL=http://localhost:11434/v1`, `OPENAI_API_KEY=ollama`, retries 5.
 
 ## Roadmap (próximas fases)
 
-- **Poda por LLM**: condensar histórico antigo via summarização (§B completa)
+- **Trigger por tokens reais**: hoje a poda usa itens/caracteres como proxy (não há tokenizador offline)
 - **HITL avançado**: override de parâmetros na aprovação, timeout de decisão
 - **Validação com Zod** (hoje a validação é manual)
 - **Testes de integração** com Ollama local de ponta a ponta

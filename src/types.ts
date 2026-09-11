@@ -3,7 +3,7 @@
  * Fonte: spec.md (§1–§3) e suggests.md (§3A — eventos via geradores assíncronos).
  *
  * Desvios documentados em relação à spec:
- * - `TExecutionResult` ganha os campos aditivos `rounds` e `toolCalls`.
+ * - `TExecutionResult` ganha os campos aditivos `rounds`, `toolCalls` e `summaries`.
  * - `TAgent.thinking` é opcional: valores fora do suporte do modelo são
  *   simplesmente ignorados pelo provider (passthrough de reasoning.effort).
  * - `Tool.execute` recebe os parâmetros já parseados (objeto), não a string JSON.
@@ -31,6 +31,8 @@ export interface TExecutionResult {
   content: TContent;
   rounds: number;
   toolCalls: number;
+  /** Quantas vezes o histórico foi condensado por LLM (§B). */
+  summaries: number;
 }
 
 /** Nível de raciocínio (spec §3) — passthrough de `reasoning.effort`. */

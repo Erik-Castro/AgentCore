@@ -6,8 +6,9 @@
  * - Loop ReAct: pensamento/ação/observação via stream (spec §4).
  * - Tool calling: itens `function_call` do round são executados e devolvidos
  *   como `function_call_output` no histórico (self-healing incluso, §C).
- * - Poda de contexto determinística simples (§B reduzida) via limites de
- *   itens/caracteres (sumarização por LLM fica para depois).
+ * - Gestão de contexto (§B): poda determinística por padrão; com um
+ *   `summarizer` opt-in, o prefixo antigo é condensado por LLM mantendo as
+ *   últimas interações intactas (fallback determinístico como safety net).
  * - `cancel()` via AbortSignal habilita graceful shutdown (spec §4).
  *
  * O transport é injetável (`responses`): tests offline usam um provider fake;
@@ -24,12 +25,14 @@ import type {
 } from "./types.ts";
 import { mapResponseStream, type RoundOutcome } from "./events.ts";
 import { ToolRegistry, toOpenAITool } from "./tools.ts";
+import type { Summarizer } from "./summarizer.ts";
 import { createClient } from "./client.ts";
 import { loadRuntimeConfig } from "./config.ts";
 
 const DEFAULT_MAX_ROUNDS = 6;
 const DEFAULT_MAX_CONTEXT_ITEMS = 40;
 const DEFAULT_MAX_CONTEXT_CHARS = 120_000;
+const DEFAULT_SUMMARIZE_KEEP_RECENT = 6;
 
 /** Requisição de um único round ao provider (modelo de baixo nível). */
 export interface ResponsesCallRequest {
@@ -70,6 +73,13 @@ export interface ReActOptions {
   client?: OpenAI;
   maxContextItems?: number;
   maxContextChars?: number;
+  /**
+   * Condensa o histórico antigo por LLM (§B). Opt-in: sem ele, a poda
+   * determinística (splice + limite por chars) é a única ativa.
+   */
+  summarizer?: Summarizer;
+  /** Quantos itens finais do histórico ficam intactos na sumarização (§B). */
+  summarizeKeepRecent?: number;
 }
 
 /**
@@ -88,6 +98,9 @@ export class ReAct {
   private readonly _responses: ResponsesCall;
   private readonly _maxContextItems: number;
   private readonly _maxContextChars: number;
+  private readonly _summarizer?: Summarizer;
+  private readonly _summarizeKeepRecent: number;
+  private _summaries = 0;
   private _ac: AbortController | null = null;
   private _state: "idle" | "running" | "paused" = "idle";
   private _pendingApproval: {
@@ -117,6 +130,9 @@ export class ReAct {
       defaultResponsesCall(options.client ?? createClient(loadRuntimeConfig()));
     this._maxContextItems = options.maxContextItems ?? DEFAULT_MAX_CONTEXT_ITEMS;
     this._maxContextChars = options.maxContextChars ?? DEFAULT_MAX_CONTEXT_CHARS;
+    this._summarizer = options.summarizer;
+    this._summarizeKeepRecent = options.summarizeKeepRecent ??
+      DEFAULT_SUMMARIZE_KEEP_RECENT;
   }
 
   // ---- Event listeners (spec §5) -----------------------------------------
@@ -180,11 +196,17 @@ export class ReAct {
     return this._callings;
   }
 
+  /** Quantidade de condensações de histórico por LLM nesta execução (§B). */
+  public get summaries(): number {
+    return this._summaries;
+  }
+
   /** Limpa o histórico da conversa (nova sessão no mesmo motor). */
   public reset(): void {
     this._messages = [];
     this._rounds = 0;
     this._callings = 0;
+    this._summaries = 0;
   }
 
   private toUserItem(prompt: string): Responses.ResponseInputItem {
@@ -203,6 +225,43 @@ export class ReAct {
         this._messages.shift();
       }
     }
+  }
+
+  /**
+   * Gestão de contexto (§B): com `summarizer` configurado, o prefixo antigo
+   * (tudo antes das últimas `summarizeKeepRecent` mensagens) é condensado em um
+   * único item de sistema. Falha ou resumo vazio caem na poda determinística.
+   */
+  private async manageContext(signal: AbortSignal): Promise<void> {
+    const overItems = this._messages.length > this._maxContextItems;
+    const overChars =
+      this._maxContextChars > 0 &&
+      JSON.stringify(this._messages).length > this._maxContextChars;
+    if (!overItems && !overChars) return;
+
+    const keepFrom = this._messages.length - this._summarizeKeepRecent;
+    if (this._summarizer && keepFrom > 0) {
+      const prefix = this._messages.slice(0, keepFrom);
+      try {
+        const summary = await this._summarizer({
+          messages: prefix as Responses.ResponseInputItem[],
+          instructions: this._system_prompt,
+          model: this._model,
+          signal,
+        });
+        if (summary.trim()) {
+          this._messages.splice(0, keepFrom, {
+            role: "system",
+            content: `Resumo do contexto anterior:\n${summary}`,
+          });
+          this._summaries++;
+          return;
+        }
+      } catch {
+        // fallback determinístico abaixo
+      }
+    }
+    this.prune();
   }
 
   /**
@@ -231,13 +290,14 @@ export class ReAct {
       content: { content: finalContent, reasoning: finalReasoning },
       rounds: this._rounds,
       toolCalls: this._callings,
+      summaries: this._summaries,
     });
 
     try {
       for (;;) {
         if (this._rounds >= this._maxRounds) break;
         this._rounds++;
-        this.prune();
+        await this.manageContext(signal);
 
         const stream = await this._responses({
           model: this._model,

@@ -5,7 +5,14 @@
 import type { Responses } from "openai/resources/responses";
 import { assertEquals } from "jsr:@std/assert@1";
 import { ReAct, type ResponsesCall } from "./react.ts";
+import type { Summarizer } from "./summarizer.ts";
 import type { AgentEvent, TExecutionResult, Tool } from "./types.ts";
+
+type ResponseInputItemLike = {
+  role?: string;
+  content?: unknown;
+  type?: string;
+};
 
 type Ev = Responses.ResponseStreamEvent;
 
@@ -461,6 +468,99 @@ Deno.test("HITL: cancel() estando pausado encerra sem deadlock", async () => {
   }
   assertEquals(events.find((e) => e.type === "tool_interrupt") !== undefined, true);
   assertEquals(events.at(-1)?.type, "aborted");
+  assertEquals(result !== undefined, true);
+  assertEquals(agent.state, "idle");
+});
+
+Deno.test("poda §B: summarizer condensa o prefixo e mantém as últimas interações", async () => {
+  const summarizedPrefixes: Array<ResponseInputItemLike[]> = [];
+  const responses: ResponsesCall = async (request) => {
+    if (request.input[0] && (request.input[0] as { role?: string }).role === "system") {
+      const first = request.input[0] as { content?: unknown };
+      assertEquals(
+        String(first.content).startsWith("Resumo do contexto anterior:"),
+        true,
+      );
+      assertEquals(String(first.content).includes("CONTEXTO RESUMIDO"), true);
+      assertEquals((request.input.at(-1) as { type?: string }).type, "function_call_output");
+      assertEquals(request.input.length, 3);
+    }
+    return streamOf(toolRound("uppercase", '{"text":"oi"}'));
+  };
+  const summarizer: Summarizer = async ({ messages }) => {
+    summarizedPrefixes.push(messages as ResponseInputItemLike[]);
+    return "CONTEXTO RESUMIDO";
+  };
+  const agent = new ReAct(
+    { model: "model-x", system_prompt: "sys", maxRounds: 4 },
+    { responses, summarizer, summarizeKeepRecent: 2, maxContextItems: 3 },
+  );
+  agent.registryTool(uppercaseTool);
+
+  const { result } = await collect(agent.run("loop de tools"));
+  assertEquals(summarizedPrefixes.length, 2);
+  const firstPrefix = summarizedPrefixes[0];
+  assertEquals(firstPrefix.length, 3);
+  assertEquals(
+    (firstPrefix[0] as { role?: string }).role,
+    "user",
+  );
+  assertEquals(result.summaries, 2);
+  assertEquals(result.rounds, 4);
+  assertEquals(result.toolCalls, 4);
+});
+
+Deno.test("poda §B: summarizer que lança/retorna vazio cai na poda determinística", async () => {
+  let calls = 0;
+  const responses: ResponsesCall = async () => {
+    calls++;
+    return streamOf(toolRound("uppercase", '{"text":"oi"}'));
+  };
+  const thrower: Summarizer = async () => {
+    throw new Error("sumarizador fora do ar");
+  };
+  const agent = new ReAct(
+    { model: "model-x", system_prompt: "sys", maxRounds: 3 },
+    { responses, summarizer: thrower, summarizeKeepRecent: 2, maxContextItems: 3 },
+  );
+  agent.registryTool(uppercaseTool);
+
+  const { result } = await collect(agent.run("loop"));
+  assertEquals(result.summaries, 0);
+  assertEquals(result.rounds, 3);
+  assertEquals(agent.state, "idle");
+})
+
+Deno.test("poda §B: cancel() durante a sumarização encerra sem deadlock", async () => {
+  const hanging: Summarizer = async ({ signal }) =>
+    new Promise<string>((_resolve, reject) => {
+      signal.addEventListener("abort", () =>
+        reject(new DOMException("abortado", "AbortError"))
+      );
+    });
+  const responses: ResponsesCall = async () => streamOf(toolRound("uppercase", '{"text":"oi"}'));
+  const agent = new ReAct(
+    { model: "model-x", system_prompt: "sys", maxRounds: 4 },
+    { responses, summarizer: hanging, summarizeKeepRecent: 2, maxContextItems: 3 },
+  );
+  agent.registryTool(uppercaseTool);
+
+  const generator = agent.run("loop");
+  let result: TExecutionResult | undefined;
+  let cancelled = false;
+  for (;;) {
+    const pending = generator.next();
+    if (!cancelled) {
+      cancelled = true;
+      setTimeout(() => agent.cancel(), 1);
+    }
+    const { value, done } = await pending;
+    if (done) {
+      result = value;
+      break;
+    }
+  }
+  assertEquals(cancelled, true);
   assertEquals(result !== undefined, true);
   assertEquals(agent.state, "idle");
 });
