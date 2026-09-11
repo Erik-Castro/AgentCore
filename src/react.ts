@@ -10,9 +10,40 @@
  *   `summarizer` opt-in, o prefixo antigo é condensado por LLM mantendo as
  *   últimas interações intactas (fallback determinístico como safety net).
  * - `cancel()` via AbortSignal habilita graceful shutdown (spec §4).
+ * - HITL (§D): ferramentas `sensitive` pausam o loop para aprovação humana.
  *
- * O transport é injetável (`responses`): tests offline usam um provider fake;
+ * O transport é injetável (`responses`): testes offline usam um provider fake;
  * o default chama `client.responses.create({ stream:true })` contra o Ollama.
+ *
+ * @example Mecanismo completo de uma execução:
+ * ```ts
+ * import { ReAct, createLLMSummarizer } from "./src/mod.ts";
+ *
+ * const agent = new ReAct(
+ *   {
+ *     model: "qwen3:4b",
+ *     system_prompt: "Você é um assistente que transforma textos.",
+ *     maxRounds: 6,
+ *   },
+ *   {
+ *     approvalTimeoutMs: 30_000,          // HITL: auto-recusa se sumir
+ *     summarizer: createLLMSummarizer(callLLM), // poda por LLM (§B)
+ *   },
+ * );
+ * agent.registryTool(uppercaseTool);
+ *
+ * for await (const event of agent.run("Converte 'oi' para maiúsculas")) {
+ *   switch (event.type) {
+ *     case "reasoning":  process.stdout.write(event.token); break;
+ *     case "tool_call":  console.log(`\n[chama ${event.tool}]`); break;
+ *     case "tool_interrupt":
+ *       agent.resume(confirm(`Permitir ${event.tool}?`));
+ *       break;
+ *     case "tool_result": console.log(`[${event.ok ? "ok" : "erro"}] ${event.output}`); break;
+ *   }
+ * }
+ * ```
+ * @module react
  */
 import type OpenAI from "openai";
 import type { Responses } from "openai/resources/responses";
@@ -34,17 +65,58 @@ const DEFAULT_MAX_CONTEXT_ITEMS = 40;
 const DEFAULT_MAX_CONTEXT_CHARS = 120_000;
 const DEFAULT_SUMMARIZE_KEEP_RECENT = 6;
 
-/** Requisição de um único round ao provider (modelo de baixo nível). */
+/**
+ * Requisição de um único round ao provider (modelo de baixo nível).
+ *
+ * É o que o harness monta a cada iteração do loop e entrega ao `ResponsesCall`
+ * injetado (ou ao default que chama `client.responses.create`).
+ *
+ * @example
+ * ```ts
+ * const request: ResponsesCallRequest = {
+ *   model: "qwen3:4b",
+ *   instructions: "Você é um assistente.",
+ *   input: [{ role: "user", content: [{ type: "input_text", text: "oi" }] }],
+ *   tools: [toOpenAITool(uppercaseTool)],
+ *   reasoning: { effort: "high" },
+ *   signal,
+ * };
+ * ```
+ */
 export interface ResponsesCallRequest {
+  /** Modelo para este round. */
   model: string;
+  /** Instruções de sistema (fora do histórico). */
   instructions: string;
+  /** Histórico acumulado (mensagens + function_call/output). */
   input: Responses.ResponseInputItem[];
+  /** Ferramentas registradas, convertidas para o formato do SDK. */
   tools: Responses.Tool[];
+  /** Nível de raciocínio (passthrough; presente apenas se configurado). */
   reasoning?: { effort?: ThinkingLevel | null };
+  /** Signal da execução — `cancel()` aborta o stream do round. */
   signal: AbortSignal;
 }
 
-/** Provider do transport: retorna o iterável de eventos do stream. */
+/**
+ * Provider do transport: retorna o iterável de eventos do stream.
+ *
+ * O default usa `client.responses.create({ stream: true })`. Em testes,
+ * injeta-se um provider fake que devolve eventos sintéticos — permitindo a
+ * suíte offline (sem rede).
+ *
+ * @example
+ * ```ts
+ * const fakeLLM: ResponsesCall = async ({ signal }) => {
+ *   const events: Responses.ResponseStreamEvent[] = [
+ *     { type: "response.output_text.delta", delta: "Olá", ... },
+ *   ];
+ *   const controller = new AbortController();
+ *   signal.addEventListener("abort", () => controller.abort());
+ *   return asyncIterable(events, controller.signal); // helper de teste
+ * };
+ * ```
+ */
 export type ResponsesCall = (
   request: ResponsesCallRequest,
 ) => Promise<AsyncIterable<Responses.ResponseStreamEvent>>;
@@ -66,31 +138,87 @@ function defaultResponsesCall(client: OpenAI): ResponsesCall {
   };
 }
 
+/**
+ * Opções opcionais do construtor de {@link ReAct}.
+ *
+ * Tudo aqui é opcional; os defaults cobrem o uso mais comum (Ollama local).
+ *
+ * @example
+ * ```ts
+ * const options: ReActOptions = {
+ *   responses: fakeLLM,              // testes offline (default: cliente real)
+ *   maxContextItems: 40,             // default 40
+ *   maxContextChars: 120_000,        // default 120k chars
+ *   summarizer: createLLMSummarizer(fakeLLM), // opt-in (§B)
+ *   summarizeKeepRecent: 6,          // 2 interações intactas
+ *   approvalTimeoutMs: 0,            // HITL sem deadline (default)
+ * };
+ * ```
+ */
 export interface ReActOptions {
   /** Provider injetado (tests offline). Default: cliente OpenAI real. */
   responses?: ResponsesCall;
   /** Cliente OpenAI injetado (alternativa ao provider). Default: criado de env. */
   client?: OpenAI;
+  /** Máx. de itens no histórico antes da poda/sumarização (§B). Default: 40. */
   maxContextItems?: number;
+  /** Máx. de caracteres do JSON do histórico (§B). Default: 120_000. */
   maxContextChars?: number;
   /**
    * Condensa o histórico antigo por LLM (§B). Opt-in: sem ele, a poda
    * determinística (splice + limite por chars) é a única ativa.
+   *
+   * @example `summarizer: createLLMSummarizer(responses)` reusa o provider.
    */
   summarizer?: Summarizer;
-  /** Quantos itens finais do histórico ficam intactos na sumarização (§B). */
+  /** Quantos itens finais do histórico ficam intactos na sumarização (§B). Default: 6. */
   summarizeKeepRecent?: number;
   /**
    * Tempo máximo (ms) para a decisão HITL (§D). `0` (default) = sem limite.
    * Ao vencer sem `resume()`, a tool é auto-recusada (`tool_denied` com
    * `reason: "timeout"`), evitando deadlock quando o consumidor some.
+   *
+   * @example `approvalTimeoutMs: 5_000` recusa automaticamente após 5s.
    */
   approvalTimeoutMs?: number;
 }
 
 /**
- * Harness ReAct (spec §5):
- *   private _messages/_system_prompt/_rounds/_callings/_maxRounds/_think_level/_model/_tools
+ * Harness ReAct (spec §5).
+ *
+ * Estado interno: histórico `_messages`, instruções, rounds/calls contados,
+ * máximo de rounds, nível de `thinking`, modelo, registro de ferramentas e o
+ * transport injetável. Toda execução cria um `AbortController` próprio.
+ *
+ * Uso básico:
+ * @example
+ * ```ts
+ * const agent = new ReAct({
+ *   model: "qwen3:4b",
+ *   system_prompt: "Você é um assistente.",
+ *   maxRounds: 6,
+ * });
+ * agent.registryTool(uppercaseTool);
+ *
+ * const result = await collect(agent.run("Olá!"));
+ * console.log(result.content.content, result.toolCalls);
+ * ```
+ *
+ * Com HITL (aprovação humana) e poda por LLM:
+ * @example
+ * ```ts
+ * const agent = new ReAct(
+ *   { model: "qwen3:4b", system_prompt: "Pode deletar dados se o usuário aprovar.", maxRounds: 8 },
+ *   { approvalTimeoutMs: 15_000, summarizer: createLLMSummarizer(responses) },
+ * );
+ * agent.registryTool(deleteTool); // sensitive: true
+ *
+ * for await (const event of agent.run("Deleta o registro 42")) {
+ *   if (event.type === "tool_interrupt") {
+ *     agent.resume(confirm(`Permitir ${event.tool}?`));
+ *   }
+ * }
+ * ```
  */
 export class ReAct {
   private _messages: Array<Responses.ResponseInputItem | Responses.ResponseOutputItem> = [];
@@ -128,6 +256,19 @@ export class ReAct {
   private _reasoningCb?: (token: string) => void;
   private _contentCb?: (token: string) => void;
 
+  /**
+   * Cria o agente.
+   *
+   * @param config Configuração primária (modelo, prompt, rounds) — veja {@link TAgent}.
+   * @param options Opções adicionais — veja {@link ReActOptions}.
+   * @example
+   * ```ts
+   * const agent = new ReAct(
+   *   { model: "qwen3:4b", thinking: "high", system_prompt: "...", maxRounds: 6 },
+   *   { /* opcional: responses, client, summarizer, approvalTimeoutMs... *\/ },
+   * );
+   * ```
+   */
   constructor(config: TAgent, options: ReActOptions = {}) {
     this._model = config.model;
     this._system_prompt = config.system_prompt;
@@ -145,28 +286,93 @@ export class ReAct {
 
   // ---- Event listeners (spec §5) -----------------------------------------
 
+  /**
+   * Callback de chamada de ferramenta (espec §5 `onToolCalling`).
+   *
+   * Alternativa ao evento `tool_call`. Chamado quando um `function_call` é
+   * detectado no stream do round.
+   *
+   * @param cb Recebe o nome da tool e os argumentos em JSON string.
+   * @example
+   * ```ts
+   * agent.onToolCalling((name, args) => console.log(`→ ${name}(${args})`));
+   * ```
+   */
   public onToolCalling(cb: (name: string, params: string) => void): void {
     this._toolCallingCb = cb;
   }
 
+  /**
+   * Callback de resposta da ferramenta (spec §5 `onToolResponse`).
+   *
+   * Chamado após cada execução, com o resultado (ou o erro, quando `ok:false`).
+   *
+   * @param cb Recebe o nome da tool e a string de saída (ou erro).
+   * @example
+   * ```ts
+   * agent.onToolResponse((name, response) => console.log(`← ${name}: ${response}`));
+   * ```
+   */
   public onToolResponse(cb: (name: string, response: string) => void): void {
     this._toolResponseCb = cb;
   }
 
+  /**
+   * Callback de raciocínio (spec §5 `onReasoning`).
+   *
+   * Recebe cada delta de raciocínio conforme chega no stream.
+   *
+   * @param cb Recebe o token/delta de raciocínio.
+   * @example
+   * ```ts
+   * agent.onReasoning((token) => process.stdout.write(token));
+   * ```
+   */
   public onReasoning(cb: (token: string) => void): void {
     this._reasoningCb = cb;
   }
 
+  /**
+   * Callback de conteúdo (spec §5 `onContent`).
+   *
+   * Recebe cada delta do texto de resposta visível ao usuário.
+   *
+   * @param cb Recebe o token/delta de texto.
+   * @example
+   * ```ts
+   * agent.onContent((token) => process.stdout.write(token));
+   * ```
+   */
   public onContent(cb: (token: string) => void): void {
     this._contentCb = cb;
   }
 
-  /** Injeção de ferramentas (spec §5). */
+  /**
+   * Injeção de ferramentas (spec §5 `registryTool`).
+   *
+   * @param tool Ferramenta a registrar — veja {@link Tool}.
+   * @throws {Error} Se o nome já estiver registrado.
+   * @example
+   * ```ts
+   * agent.registryTool({ name: "uppercase", description: "...", execute: () => "OI" });
+   * ```
+   */
   public registryTool(tool: Tool): void {
     this._registry.register(tool);
   }
 
-  /** Encerramento gracioso do round em curso (spec §4 `cancel()`). */
+  /**
+   * Encerramento gracioso do round em curso (spec §4 `cancel()`).
+   *
+   * Aborta o `AbortSignal` do round. Se houver aprovação HITL pendente
+   * (`tool_interrupt`), ela é resolvida como **recusada** — o gerador termina
+   * com evento `aborted`, sem deadlock.
+   *
+   * @example
+   * ```ts
+   * setTimeout(() => agent.cancel(), 3_000); // timeout do consumidor
+   * ```
+   */
   public cancel(): void {
     const pending = this._pendingApproval;
     if (pending) {
@@ -176,7 +382,17 @@ export class ReAct {
     this._ac?.abort();
   }
 
-  /** Estado do motor: `paused` significa aguardando `resume(...)` (§D). */
+  /**
+   * Estado do motor: `paused` significa aguardando `resume(...)` (§D).
+   *
+   * `idle` (sem execução), `running` (executando um `run()`) ou `paused`
+   * (parado num `tool_interrupt` aguardando decisão).
+   *
+   * @example
+   * ```ts
+   * if (agent.state === "paused") { /* consumidor reagiu tarde *\/ }
+   * ```
+   */
   public get state(): "idle" | "running" | "paused" {
     return this._state;
   }
@@ -187,6 +403,22 @@ export class ReAct {
    * com os parâmetros ajustados pelo usuário (override, revalidado pelo
    * `executeSafe`). `false` injeta a recusa do usuário no contexto e emite
    * `tool_denied` (params são ignorados na recusa).
+   *
+   * @param approved `true` executa; `false` recusa (emite `tool_denied`).
+   * @param params Override opcional dos argumentos (valores ajustados pelo
+   *               usuário); revalidado pelo schema da tool.
+   * @throws {Error} Se não houver aprovação pendente.
+   * @example
+   * ```ts
+   * if (event.type === "tool_interrupt") {
+   *   if (event.tool === "delete_record") {
+   *     const id = prompt("Qual registro?") ?? "";
+   *     agent.resume(true, { id: Number(id) }); // override do alvo
+   *   } else {
+   *     agent.resume(confirm(`Permitir ${event.tool}?`));
+   *   }
+   * }
+   * ```
    */
   public resume(approved: boolean, params?: Record<string, unknown>): void {
     if (!this._pendingApproval) {
@@ -198,10 +430,12 @@ export class ReAct {
     if (this._state === "paused") this._state = "running";
   }
 
+  /** Rounds executados na última (ou atual) execução. */
   public get rounds(): number {
     return this._rounds;
   }
 
+  /** Chamadas de ferramenta executadas na última (ou atual) execução. */
   public get toolCalls(): number {
     return this._callings;
   }
@@ -211,7 +445,20 @@ export class ReAct {
     return this._summaries;
   }
 
-  /** Limpa o histórico da conversa (nova sessão no mesmo motor). */
+  /**
+   * Limpa o histórico da conversa (nova sessão no mesmo motor).
+   *
+   * Zera histórico, contadores de rounds/calls e summaries — útil para
+   * reusar o mesmo agente/ferramentas com um novo usuário.
+   *
+   * @example
+   * ```ts
+   * const agent = new ReAct(config);
+   * await collect(agent.run("primeira pergunta"));
+   * agent.reset();
+   * await collect(agent.run("outra pergunta")); // contexto zerado
+   * ```
+   */
   public reset(): void {
     this._messages = [];
     this._rounds = 0;
@@ -277,6 +524,35 @@ export class ReAct {
   /**
    * Loop ReAct (spec §5 `run`, redefinido como gerador pelo suggests.md §3A):
    * emite eventos em tempo real e retorna o `TExecutionResult` no final.
+   *
+   * O gerador pausa entre eventos: cada `yield` devolve um {@link AgentEvent};
+   * quando o loop termina (resposta final, erros, `aborted` ou `maxRounds`),
+   * o `return` entrega o {@link TExecutionResult} com tokens/time/rounds.
+   *
+   * @param prompt Prompt do usuário (vira o primeiro item do histórico).
+   * @returns `AsyncGenerator` — consuma com `for await` ou manualmente via
+   *          `.next()`. O valor de `done` é o `TExecutionResult`.
+   * @example
+   * ```ts
+   * const generator = agent.run("Some 3 + 4");
+   * let result: TExecutionResult | undefined;
+   * for (;;) {
+   *   const { done, value } = await generator.next();
+   *   if (done) { result = value; break; }
+   *   if (value.type === "content") process.stdout.write(value.token);
+   * }
+   * console.log(`rounds=${result!.rounds} calls=${result!.toolCalls}`);
+   * ```
+   *
+   * @example Com `for await`, pausando em aprovações HITL:
+   * ```ts
+   * for await (const event of agent.run("Apague o registro 42")) {
+   *   if (event.type === "tool_interrupt") {
+   *     agent.resume(confirm(`Permitir ${event.tool}(${event.args})?`));
+   *   }
+   * }
+   * console.log(agent.state); // "idle" ao final
+   * ```
    */
   public async *run(prompt: string): AsyncGenerator<AgentEvent, TExecutionResult, void> {
     const started = performance.now();
