@@ -94,12 +94,16 @@ const agent = new ReAct(
 ## Como rodar
 
 ```bash
-deno task dev     # demo interativa contra o Ollama local (main.ts)
-deno task check   # typecheck de main.ts + mod.ts + src/mod.ts
-deno task test    # suíte offline (52 testes): eventos, tools, loop ReAct, tokens, config e summarizer
+deno task dev       # demo interativa contra o Ollama local (main.ts)
+deno task check     # typecheck de main.ts + mod.ts + src/mod.ts
+deno task test      # suíte offline (52 testes): eventos, tools, loop ReAct, tokens, config e summarizer
+deno task test:int  # integração E2E contra o Ollama local (precisa servidor + modelo)
 ```
 
 Defaults sem env: `OPENAI_BASE_URL=http://localhost:11434/v1`, `OPENAI_API_KEY=ollama`, retries 5.
+Os testes de integração (`test:int`) usam o modelo `nemotron-3-nano:30b-cloud` por
+default — troque com `OPENAI_MODEL`. Sem Ollama de pé ou sem o modelo instalado,
+eles falham com uma mensagem clara (não falham "no susto").
 
 ## Uso como biblioteca local
 
@@ -118,7 +122,10 @@ const agent = new ReAct({
 
 ## Roadmap (próximas fases)
 
-- **Testes de integração** com Ollama local de ponta a ponta
+Fases planejadas concluídas: gerador assíncrono, self-healing, poda de contexto
+(com trigger por tokens), HITL, validação Zod e testes de integração com Ollama
+local de ponta a ponta. Próximos passos possíveis: levar o harness ao OllamaTask
+com base no que foi validado aqui.
 
 ## Referências
 

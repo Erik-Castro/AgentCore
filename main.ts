@@ -9,7 +9,7 @@
  *   deno task dev -- "Que horas são? Depois apague o registro 42."
  *
  * Pré-requisitos: Ollama em http://localhost:11434 e um modelo de raciocínio
- * (ex.: qwen3:4b, lfm2.5-thinking), selecionado via OPENAI_MODEL (default abaixo).
+ * (default: nemotron-3-nano:30b-cloud), selecionado via OPENAI_MODEL.
  */
 import {
   ReAct,
@@ -25,7 +25,7 @@ import { z } from "zod";
 
 const prompt = Deno.args.join(" ") ??
   "Que horas são agora? Depois, apague o registro 42 do banco.";
-const model = Deno.env.get("OPENAI_MODEL") ?? "qwen3.5:2b";
+const model = Deno.env.get("OPENAI_MODEL") ?? "nemotron-3-nano:30b-cloud";
 
 const currentTimeTool: Tool = {
   name: "current_time",
