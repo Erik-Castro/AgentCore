@@ -11,6 +11,7 @@
   },
   "imports": {
     "openai": "npm:openai@^7.15.0",
+    "zod": "npm:zod@^4",
     "agentcore": "./mod.ts"
   }
 }

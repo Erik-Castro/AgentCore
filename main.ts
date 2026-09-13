@@ -21,6 +21,7 @@ import {
   type Tool,
 } from "./src/mod.ts";
 import type { Responses } from "openai/resources/responses";
+import { z } from "zod";
 
 const prompt = Deno.args.join(" ") ??
   "Que horas são agora? Depois, apague o registro 42 do banco.";
@@ -29,18 +30,14 @@ const model = Deno.env.get("OPENAI_MODEL") ?? "qwen3.5:2b";
 const currentTimeTool: Tool = {
   name: "current_time",
   description: "Retorna a data e a hora atuais em formato ISO 8601.",
-  parameters: { type: "object", properties: {} },
+  parameters: z.object({}).strict(),
   execute: () => new Date().toISOString(),
 };
 
 const deleteRecordTool: Tool = {
   name: "delete_record",
   description: "Apaga um registro informando o id (requer aprovação humana).",
-  parameters: {
-    type: "object",
-    properties: { id: { type: "integer", description: "Id do registro" } },
-    required: ["id"],
-  },
+  parameters: z.object({ id: z.number().int().describe("Id do registro") }).strict(),
   execute: ({ id }) => `Registro ${id} apagado.`,
   sensitive: true, // HITL (§D): o loop pausa até resume(true|false)
 };

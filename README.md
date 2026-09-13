@@ -10,7 +10,7 @@ O objetivo é desenhar e validar um harness enxuto que explore os pontos fortes 
 
 ### Stack
 - **Deno 2.x** + TypeScript
-- **`npm:openai@^7.15.0`** como única dependência de runtime
+- **`npm:openai@^7.15.0`** (SDK compatível) e **`npm:zod@^4`** (validação) como dependências de runtime
 - **Ollama** como backend local (streaming-first via `client.responses.create({ stream: true })`)
 
 ### Por que baseado em spec?
@@ -30,6 +30,7 @@ A `src/` é uma implementação funcional da spec que valida as propostas:
 - **Self-healing (§C)**: falha de tool (JSON inválido, schema violado, tool desconhecida) nunca quebra o agente — o erro volta ao contexto como mensagem de sistema e o modelo tenta de novo.
 - **Gestão de contexto (§B)**: limites determinísticos de itens/caracteres impedem contexto infinito; **opt-in** para condensar o histórico antigo por LLM (`ReActOptions.summarizer`) mantendo as últimas interações intactas, com a poda determinística como *safety net*. **Trigger por tokens** (`maxContextTokens`): usa o `usage.input_tokens` real do provider (fallback: estimativa `~4 chars/token` injetável) e dispara aos ~80% da janela (`contextTokenRatio`).
 - **HITL (§D)**: tools marcadas `sensitive: true` pausam o agente (`state === "paused"`) emitindo `tool_interrupt`; a decisão chega via `resume(true|false)`. Com `approvalTimeoutMs` configurado, a decisão expira sozinha (`tool_denied` com `reason: "timeout"`) — consumidor sumido não trava o agente. `resume(true, params)` aprova com parâmetros ajustados (override revalidado pelo schema).
+- **Validação por Zod**: `Tool.parameters` é um schema Zod (v4) tipado — o `executeSafe` valida com `safeParse`, o `toOpenAITool` converte para JSON Schema via `z.toJSONSchema()` e o `loadRuntimeConfig` também valida o env (coercion, trim e `http/https`).
 - **`cancel()`** (AbortController) e **`reset()`** para lifecycle gracioso.
 - **Provider injetável**: os testes rodam 100% offline com um provider fake, sem rede.
 
@@ -95,7 +96,7 @@ const agent = new ReAct(
 ```bash
 deno task dev     # demo interativa contra o Ollama local (main.ts)
 deno task check   # typecheck de main.ts + mod.ts + src/mod.ts
-deno task test    # suíte offline (43 testes): eventos, tools, loop ReAct, tokens e summarizer
+deno task test    # suíte offline (52 testes): eventos, tools, loop ReAct, tokens, config e summarizer
 ```
 
 Defaults sem env: `OPENAI_BASE_URL=http://localhost:11434/v1`, `OPENAI_API_KEY=ollama`, retries 5.
@@ -117,7 +118,6 @@ const agent = new ReAct({
 
 ## Roadmap (próximas fases)
 
-- **Validação com Zod** (hoje a validação é manual)
 - **Testes de integração** com Ollama local de ponta a ponta
 
 ## Referências

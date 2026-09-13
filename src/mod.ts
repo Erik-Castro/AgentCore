@@ -6,6 +6,7 @@
  *
  * @example Uso de alto nível (Ollama local):
  * ```ts
+ * import { z } from "zod";
  * import {
  *   ReAct,
  *   createLLMSummarizer,
@@ -17,11 +18,7 @@
  * const sumTool: Tool = {
  *   name: "sum",
  *   description: "Soma dois números inteiros.",
- *   parameters: {
- *     type: "object",
- *     properties: { a: { type: "integer" }, b: { type: "integer" } },
- *     required: ["a", "b"],
- *   },
+ *   parameters: z.object({ a: z.number().int(), b: z.number().int() }),
  *   execute: ({ a, b }) => String(Number(a) + Number(b)),
  * };
  *

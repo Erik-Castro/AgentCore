@@ -3,6 +3,7 @@
  * Não fazem nenhuma chamada de rede.
  */
 import type { Responses } from "openai/resources/responses";
+import { z } from "zod";
 import { assertEquals } from "jsr:@std/assert@1";
 import { ReAct, type ResponsesCall } from "./react.ts";
 import type { Summarizer } from "./summarizer.ts";
@@ -136,11 +137,7 @@ function textRoundNoUsage(text: string): Ev[] {
 const uppercaseTool: Tool = {
   name: "uppercase",
   description: "Converte o texto para maiúsculas.",
-  parameters: {
-    type: "object",
-    properties: { text: { type: "string" } },
-    required: ["text"],
-  },
+  parameters: z.object({ text: z.string() }).strict(),
   execute: (params) => String(params["text"]).toUpperCase(),
 };
 
@@ -156,11 +153,7 @@ function makeAgent(responses: ResponsesCall, options: ConstructorParameters<type
 const sensitiveTool: Tool = {
   name: "sensitive_upper",
   description: "Converte para maiúsculas (requer aprovação humana).",
-  parameters: {
-    type: "object",
-    properties: { text: { type: "string" } },
-    required: ["text"],
-  },
+  parameters: z.object({ text: z.string() }).strict(),
   execute: (params) => String(params["text"]).toUpperCase(),
   sensitive: true,
 };

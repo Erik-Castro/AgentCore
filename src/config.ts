@@ -1,18 +1,35 @@
 /**
- * Configuração de ambiente (spec §2) com fallbacks locais e validação manual
- * (sem dependência extra; Zod fica documentado como caminho de upgrade).
+ * Configuração de ambiente (spec §2) com fallbacks locais e validação por
+ * **Zod** (schemas tipados com coersão; mensagens de erro estruturais).
  *
  * As variáveis lidas são:
  * - `OPENAI_BASE_URL`    — URL base da API compatível com a OpenAI (default: `http://localhost:11434/v1`)
  * - `OPENAI_API_KEY`     — chave de API (default: `ollama`, o valor que o Ollama aceita)
  * - `OPENAI_MAX_RETRIES` — tentativas do cliente HTTP (default: `5`, inteiro >= 0)
  *
+ * Valores ausentes ou em branco caem no default; valores inválidos lançam
+ * erro com os issues do Zod.
+ *
  * @module config
  */
+import { z } from "zod";
 
 const DEFAULT_BASE_URL = "http://localhost:11434/v1";
 const DEFAULT_API_KEY = "ollama";
 const DEFAULT_MAX_RETRIES = 5;
+
+/** Schema de env: campos opcionais (ausente/vazio → default no código). */
+const envSchema = z.object({
+  OPENAI_BASE_URL: z
+    .string()
+    .url()
+    .refine((url) => url.startsWith("http://") || url.startsWith("https://"), {
+      message: "deve usar http/https",
+    })
+    .optional(),
+  OPENAI_API_KEY: z.string().min(1).optional(),
+  OPENAI_MAX_RETRIES: z.coerce.number().int().nonnegative().optional(),
+});
 
 /**
  * Configuração do runtime derivada do ambiente.
@@ -38,18 +55,17 @@ export interface RuntimeConfig {
 }
 
 /**
- * Lê e valida as variáveis de ambiente.
+ * Lê e valida as variáveis de ambiente via Zod.
  * Aceita um objeto de env injetado para testes (default: `Deno.env`).
  *
  * Validações aplicadas:
  * - `OPENAI_BASE_URL` precisa ser uma URL `http`/`https` válida.
  * - `OPENAI_API_KEY` não vazia (trim).
- * - `OPENAI_MAX_RETRIES` inteiro >= 0; ausente ou vazia usa o default `5`.
+ * - `OPENAI_MAX_RETRIES` inteiro >= 0 (coerção; não-numérico lança erro).
  *
  * @param env Mapa de variáveis de ambiente. Omita para usar `Deno.env`.
  * @returns Configuração validada pronta para o cliente.
- * @throws {Error} Se `OPENAI_BASE_URL` não for uma URL http/https ou
- *                 `OPENAI_MAX_RETRIES` não for um inteiro válido.
+ * @throws {Error} Com os issues do Zod quando alguma variável for inválida.
  * @example Como usar com o cliente (sem injeção, usa `Deno.env`):
  * ```ts
  * import { loadRuntimeConfig } from "./src/config.ts";
@@ -70,28 +86,26 @@ export interface RuntimeConfig {
 export function loadRuntimeConfig(
   env: Record<string, string | undefined> = Deno.env.toObject(),
 ): RuntimeConfig {
-  const baseURL = env.OPENAI_BASE_URL?.trim() || DEFAULT_BASE_URL;
-  let parsed: URL;
-  try {
-    parsed = new URL(baseURL);
-  } catch {
-    throw new Error(`OPENAI_BASE_URL inválida: "${baseURL}"`);
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error(`OPENAI_BASE_URL deve usar http/https: "${baseURL}"`);
-  }
+  const normalized: Record<string, string | undefined> = {
+    OPENAI_BASE_URL: env.OPENAI_BASE_URL?.trim() || undefined,
+    OPENAI_API_KEY: env.OPENAI_API_KEY?.trim() || undefined,
+    OPENAI_MAX_RETRIES: env.OPENAI_MAX_RETRIES?.trim() || undefined,
+  };
 
-  const apiKey = env.OPENAI_API_KEY?.trim() || DEFAULT_API_KEY;
-
-  const rawRetries = env.OPENAI_MAX_RETRIES?.trim();
-  let maxRetries = DEFAULT_MAX_RETRIES;
-  if (rawRetries) {
-    const value = Number(rawRetries);
-    if (!Number.isInteger(value) || value < 0) {
-      throw new Error(`OPENAI_MAX_RETRIES inválida: "${rawRetries}" (esperado inteiro >= 0)`);
-    }
-    maxRetries = value;
+  const parsed = envSchema.safeParse(normalized);
+  if (!parsed.success) {
+    const messages = parsed.error.issues
+      .map((issue) => {
+        const key = issue.path.join(".") || "env";
+        return `${key}: ${issue.message}`;
+      })
+      .join("; ");
+    throw new Error(`Configuração inválida: ${messages}`);
   }
 
-  return { baseURL, apiKey, maxRetries };
+  return {
+    baseURL: parsed.data.OPENAI_BASE_URL ?? DEFAULT_BASE_URL,
+    apiKey: parsed.data.OPENAI_API_KEY ?? DEFAULT_API_KEY,
+    maxRetries: parsed.data.OPENAI_MAX_RETRIES ?? DEFAULT_MAX_RETRIES,
+  };
 }

@@ -7,9 +7,12 @@
  * - `TAgent.thinking` é opcional: valores fora do suporte do modelo são
  *   simplesmente ignorados pelo provider (passthrough de `reasoning.effort`).
  * - `Tool.execute` recebe os parâmetros já parseados (objeto), não a string JSON.
+ * - A validação de `Tool.parameters` usa **Zod** (schema tipado); o harness
+ *   converte para JSON Schema via `z.toJSONSchema` ao anunciar ao modelo.
  *
  * @module types
  */
+import type { z } from "zod";
 
 /**
  * Resposta final do modelo, separando conteúdo e raciocínio.
@@ -126,71 +129,33 @@ export interface TAgent {
 }
 
 /**
- * JSON Schema enxuto usado na validação de parâmetros das ferramentas.
- *
- * Suporta: `type`, `properties`, `required`, `items`, `enum`,
- * `description` e `additionalProperties` (os demais keywords ficam livres
- * via índice, mas não são validados). Sem dependências.
- *
- * @example
- * ```ts
- * const schema: JsonSchema = {
- *   type: "object",
- *   properties: {
- *     texto: { type: "string", description: "Texto a transformar" },
- *     repetir: { type: "integer" },
- *   },
- *   required: ["texto"],
- * };
- * ```
- */
-export interface JsonSchema {
-  /** Tipo esperado do valor (por subtipo quando é objeto/array). */
-  type?: "object" | "array" | "string" | "number" | "integer" | "boolean";
-  /** Sub-schema por propriedade (objetos). */
-  properties?: Record<string, JsonSchema>;
-  /** Propriedades obrigatórias (objetos). */
-  required?: string[];
-  /** Schema dos elementos (arrays). */
-  items?: JsonSchema;
-  /** Lista de valores permitidos (validação exata). */
-  enum?: unknown[];
-  /** Descrição para o modelo consumir. */
-  description?: string;
-  /** Exige-se objeto sem propriedades extras? (não validado, reservado). */
-  additionalProperties?: boolean;
-  [keyword: string]: unknown;
-}
-
-/**
- * Contrato de ferramenta (spec §6.3): nome + descrição + JSON Schema.
+ * Contrato de ferramenta (spec §6.3): nome + descrição + schema Zod.
  *
  * `execute` recebe os parâmetros **já parseados e validados** (objeto) e
  * devolve o resultado como string — normalmente JSON serializado para o
- * modelo interpretar.
+ * modelo interpretar. A validação usa Zod (`parameters`), e o harness
+ * converte o schema para JSON Schema (`z.toJSONSchema`) ao anunciar a tool.
  *
  * Com `sensitive: true` (HITL §D), o harness emite `tool_interrupt` e pausa
  * até o consumidor chamar `resume(true|false)`.
  *
  * @example
  * ```ts
+ * import { z } from "zod";
+ *
  * const uppercaseTool: Tool = {
  *   name: "uppercase",
  *   description: "Converte texto para maiúsculas.",
- *   parameters: {
- *     type: "object",
- *     properties: {
- *       text: { type: "string", description: "Texto de entrada" },
- *     },
- *     required: ["text"],
- *   },
+ *   parameters: z.object({
+ *     text: z.string().describe("Texto de entrada"),
+ *   }).strict(),
  *   execute: ({ text }) => String(text).toUpperCase(),
  * };
  *
  * const deleteTool: Tool = {
  *   name: "delete_record",
  *   description: "Apaga um registro (requer aprovação humana).",
- *   parameters: { type: "object", properties: { id: { type: "integer" } }, required: ["id"] },
+ *   parameters: z.object({ id: z.number().int() }).strict(),
  *   execute: ({ id }) => `Registro ${id} apagado`,
  *   sensitive: true,
  * };
@@ -201,8 +166,8 @@ export interface Tool {
   name: string;
   /** Descrição para o modelo decidir quando usar. */
   description: string;
-  /** Schema dos argumentos (`execute` recebe o objeto validado). */
-  parameters?: JsonSchema;
+  /** Schema Zod dos argumentos (`execute` recebe o objeto validado). */
+  parameters?: z.ZodTypeAny;
   /** Implementação: recebe objeto de params → devolve string (JSON ideal). */
   execute: (params: Record<string, unknown>) => string | Promise<string>;
   /** HITL (suggests.md §D): exige aprovação humana via `resume(true|false)`. */
@@ -218,7 +183,7 @@ export interface Tool {
  * @example
  * ```ts
  * const ok: ToolResult = { ok: true, output: '{"total": 7}' };
- * const fail: ToolResult = { ok: false, error: "texto: tipo inválido (esperado string)" };
+ * const fail: ToolResult = { ok: false, error: "$.text: Invalid input: expected string, received number" };
  * ```
  */
 export interface ToolResult {

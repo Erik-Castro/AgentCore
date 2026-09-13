@@ -3,124 +3,78 @@
  *
  * `executeSafe` nunca lança: retorna `ToolResult` com `ok:false` + mensagem,
  * o que alimenta a camada de auto-correção (suggests.md §C). A validação de
- * parâmetros é um JSON Schema mínimo sem dependências (Zod fica como upgrade).
+ * parâmetros usa **Zod** (`Tool.parameters`), convertido para JSON Schema
+ * (`z.toJSONSchema`) ao anunciar a tool ao modelo.
  *
  * @module tools
  */
+import { z } from "zod";
 import type { Responses } from "openai/resources/responses";
-import type { JsonSchema, Tool, ToolResult } from "./types.ts";
-
-function typeMatches(value: unknown, type: string | undefined): boolean {
-  switch (type) {
-    case "string":
-      return typeof value === "string";
-    case "number":
-      return typeof value === "number" && Number.isFinite(value);
-    case "integer":
-      return typeof value === "number" && Number.isInteger(value);
-    case "boolean":
-      return typeof value === "boolean";
-    case "array":
-      return Array.isArray(value);
-    case "object":
-      return typeof value === "object" && value !== null && !Array.isArray(value);
-    default:
-      return true;
-  }
-}
-
-function evaluate(
-  value: unknown,
-  schema: JsonSchema,
-  path: string,
-  errors: string[],
-): void {
-  if (schema.type && !typeMatches(value, schema.type)) {
-    errors.push(`${path}: tipo inválido (esperado ${schema.type})`);
-    return;
-  }
-  if (schema.enum && !schema.enum.includes(value)) {
-    errors.push(`${path}: valor fora do enum permitido`);
-  }
-  if (schema.type === "array" && schema.items && Array.isArray(value)) {
-    value.forEach((element, index) => {
-      evaluate(element, schema.items as JsonSchema, `${path}[${index}]`, errors);
-    });
-  }
-  if (
-    schema.type === "object" &&
-    typeof value === "object" &&
-    value !== null &&
-    !Array.isArray(value)
-  ) {
-    const record = value as Record<string, unknown>;
-    for (const required of schema.required ?? []) {
-      if (!(required in record)) {
-        errors.push(`${path}.${required}: obrigatório`);
-      }
-    }
-    for (const [name, sub] of Object.entries(schema.properties ?? {})) {
-      if (record[name] === undefined) continue;
-      evaluate(record[name], sub, `${path}.${name}`, errors);
-    }
-  }
-}
+import type { Tool, ToolResult } from "./types.ts";
 
 /**
- * Valida um valor contra um JSON Schema; retorna os problemas encontrados.
+ * Formata os issues de um ZodError numa única string legível.
  *
- * Função pura: não executa nada além da validação recursiva (tipos, enum,
- * required, arrays com `items` e objetos com `properties`).
+ * Cada issue vira `$.caminho: mensagem` (ex.: `$.texto: Required`); o modelo
+ * que recebe a falha no self-healing (§C) consegue corrigir com precisão.
  *
- * @param schema Schema a aplicar (veja {@link JsonSchema}).
- * @param value Valor a validar.
- * @returns Lista de mensagens de erro; vazia significa valor válido.
+ * @param error Erro de validação do Zod.
+ * @returns Mensagem consolidada, ex.: `$.id: Expected number, received string`.
  * @example
  * ```ts
- * const schema = {
- *   type: "object",
- *   properties: { nome: { type: "string" }, idade: { type: "integer" } },
- *   required: ["nome"],
- * };
- *
- * validateParams(schema, { nome: "Ana" }); // []
- * validateParams(schema, { idade: 30 });   // ["$.nome: obrigatório"]
- * validateParams(schema, { nome: "Ana", idade: "trinta" });
- * // ["$.idade: tipo inválido (esperado integer)"]
+ * formatZodIssues(z.string().safeParse(42).error!);
+ * // "Invalid input: expected string, received number"
  * ```
  */
-export function validateParams(schema: JsonSchema, value: unknown): string[] {
-  const errors: string[] = [];
-  evaluate(value, schema, "$", errors);
-  return errors;
+export function formatZodIssues(error: z.ZodError): string {
+  return error.issues
+    .map((issue) => {
+      const path = issue.path.length === 0 ? "$" : `$.${issue.path.join(".")}`;
+      return `${path}: ${issue.message}`;
+    })
+    .join("; ");
 }
 
 /**
  * Converte uma `Tool` do harness para o formato do SDK (FunctionTool).
  *
  * Usada pelo loop ReAct para anunciar as ferramentas ao modelo via
- * `tools` na chamada de cada round.
+ * `tools` na chamada de cada round. O schema Zod vira JSON Schema
+ * (`z.toJSONSchema`), sem a keyword `$schema` para não atritar com providers
+ * locais (ex.: Ollama).
  *
  * @param tool Ferramenta do harness (veja {@link Tool}).
  * @returns Tool no formato `Responses.Tool` (type `"function"`).
  * @example
  * ```ts
- * toOpenAITool(uppercaseTool);
+ * import { z } from "zod";
+ * const tool: Tool = {
+ *   name: "uppercase",
+ *   description: "Converte texto para maiúsculas.",
+ *   parameters: z.object({ text: z.string() }).strict(),
+ *   execute: ({ text }) => String(text).toUpperCase(),
+ * };
+ *
+ * toOpenAITool(tool);
  * // {
  * //   type: "function",
  * //   name: "uppercase",
  * //   description: "Converte texto para maiúsculas.",
- * //   parameters: { type: "object", ... },
+ * //   parameters: { type: "object", properties: { text: { type: "string" } },
+ * //                  required: ["text"], additionalProperties: false },
  * //   strict: false,
  * // }
  * ```
  */
 export function toOpenAITool(tool: Tool): Responses.Tool {
+  const { $schema: _schema, ...parameters } = tool.parameters
+    ? z.toJSONSchema(tool.parameters)
+    : ({} as Record<string, unknown>);
   return {
     type: "function",
     name: tool.name,
     description: tool.description,
-    parameters: tool.parameters ?? null,
+    parameters: Object.keys(parameters).length > 0 ? parameters : null,
     strict: false,
   };
 }
@@ -196,13 +150,13 @@ export class ToolRegistry {
   }
 
   /**
-   * Executa com sandboxing: parse de JSON, validação de schema e try/catch.
+   * Executa com sandboxing: parse de JSON, validação Zod e try/catch.
    * Nunca lança — falhas viram `{ ok:false, error }` para o self-healing (§C).
    *
    * Fluxo de validação:
    * 1. Tool existe? (senão `Ferramenta desconhecida`)
    * 2. `argsJson` parseia como objeto? (senão `Argumentos JSON inválidos`)
-   * 3. Params passam no JSON Schema? (senão lista de erros)
+   * 3. `schema.safeParse(params)` passa? (senão issues formatados do Zod)
    * 4. `tool.execute(params)` não lança? (senão `Falha ao executar`)
    *
    * @param name Nome da ferramenta registrada.
@@ -217,7 +171,7 @@ export class ToolRegistry {
    * // { ok: false, error: "Argumentos JSON inválidos: ..." }
    *
    * const badSchema = await registry.executeSafe("uppercase", '{"text":123}');
-   * // { ok: false, error: "$.text: tipo inválido (esperado string)" }
+   * // { ok: false, error: "$.text: Invalid input: expected string, received number" }
    * ```
    */
   async executeSafe(name: string, argsJson: string): Promise<ToolResult> {
@@ -244,9 +198,12 @@ export class ToolRegistry {
       return { ok: false, error: "Os argumentos devem ser um objeto JSON" };
     }
 
-    const problems = validateParams(tool.parameters ?? {}, params);
-    if (problems.length > 0) {
-      return { ok: false, error: problems.join("; ") };
+    if (tool.parameters) {
+      const parsed = tool.parameters.safeParse(params);
+      if (!parsed.success) {
+        return { ok: false, error: formatZodIssues(parsed.error) };
+      }
+      params = parsed.data as unknown as Record<string, unknown>;
     }
 
     try {
