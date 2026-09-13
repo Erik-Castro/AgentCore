@@ -53,6 +53,8 @@ import type {
   TExecutionResult,
   ThinkingLevel,
   Tool,
+  ToolCall,
+  ToolResult,
 } from "./types.ts";
 import { mapResponseStream, type RoundOutcome } from "./events.ts";
 import { ToolRegistry, toOpenAITool } from "./tools.ts";
@@ -60,6 +62,7 @@ import { estimateTokens, type TokenEstimator } from "./tokens.ts";
 import type { Summarizer } from "./summarizer.ts";
 import { createClient } from "./client.ts";
 import { loadRuntimeConfig } from "./config.ts";
+import { appendLineLocked, createRunWorkspace, type Workspace } from "./env.ts";
 
 const DEFAULT_MAX_ROUNDS = 6;
 const DEFAULT_MAX_CONTEXT_ITEMS = 40;
@@ -96,6 +99,8 @@ export interface ResponsesCallRequest {
   tools: Responses.Tool[];
   /** Nível de raciocínio (passthrough; presente apenas se configurado). */
   reasoning?: { effort?: ThinkingLevel | null };
+  /** Chamadas simultâneas (`parallel_tool_calls` no request do round). */
+  parallelToolCalls?: boolean;
   /** Signal da execução — `cancel()` aborta o stream do round. */
   signal: AbortSignal;
 }
@@ -132,6 +137,7 @@ function defaultResponsesCall(client: OpenAI): ResponsesCall {
         input: request.input as unknown as Responses.ResponseInput,
         tools: request.tools,
         reasoning: request.reasoning ?? undefined,
+        parallel_tool_calls: request.parallelToolCalls,
         stream: true,
       },
       { signal: request.signal },
@@ -207,6 +213,32 @@ export interface ReActOptions {
    * @example `approvalTimeoutMs: 5_000` recusa automaticamente após 5s.
    */
   approvalTimeoutMs?: number;
+  /**
+   * Chamadas de ferramenta simultâneas no round. Default: `true`.
+   *
+   * Com `true`, o harness envia `parallel_tool_calls` no request e executa as
+   * ferramentas **não sensíveis** do mesmo round de forma **concorrente**
+   * (`Promise.all`), preservando a ordem determinística do histórico. Com
+   * `false`, o modelo pede uma tool por vez e a execução é sequencial —
+   * útil para ferramentas com efeitos colaterais ou ordem dependente.
+   *
+   * @example `parallelToolCalls: false` desliga o lote simultâneo.
+   */
+  parallelToolCalls?: boolean;
+  /**
+   * Diretório base dos artefatos de execução (run log) — **opt-in**.
+   *
+   * Quando definido, cada `run()` cria um workspace persistente (subdiretório
+   * `run-*` com modo `0o700`, via `Deno.makeTempDir`) e grava `run.log` — uma
+   * linha JSON por ferramenta executada, anexada **sob flock** (ordem = ordem
+   * das chamadas). O caminho do workspace volta em `TExecutionResult.workspace`.
+   *
+   * Sem essa opção (default), nenhum artefato é criado e o comportamento é
+   * idêntico ao atual.
+   *
+   * @example `workspaceDir: ".agentcore"` persiste o run log para inspeção.
+   */
+  workspaceDir?: string;
 }
 
 /**
@@ -264,6 +296,9 @@ export class ReAct {
   private readonly _summarizer?: Summarizer;
   private readonly _summarizeKeepRecent: number;
   private readonly _approvalTimeoutMs: number;
+  private readonly _parallelToolCalls: boolean;
+  private readonly _workspaceDir?: string;
+  private _workspace: Workspace | null = null;
   private _summaries = 0;
   private _ac: AbortController | null = null;
   /** Uso real de entrada do último round (null antes do 1º round / sem usage). */
@@ -319,6 +354,8 @@ export class ReAct {
     this._summarizeKeepRecent = options.summarizeKeepRecent ??
       DEFAULT_SUMMARIZE_KEEP_RECENT;
     this._approvalTimeoutMs = options.approvalTimeoutMs ?? 0;
+    this._parallelToolCalls = options.parallelToolCalls ?? true;
+    this._workspaceDir = options.workspaceDir;
   }
 
   // ---- Event listeners (spec §5) -----------------------------------------
@@ -537,6 +574,27 @@ export class ReAct {
   }
 
   /**
+   * Run log do workspace persistente (`ReActOptions.workspaceDir`): uma linha
+   * JSON por ferramenta executada, anexada **sob flock** (`appendLineLocked`).
+   *
+   * A chamada é aguardada na passada sequencial do loop, então a ordem das
+   * linhas espelha a ordem das chamadas — mesmo com execução concorrente no
+   * lote paralelo (§C paralelo). Sem workspace, não faz nada.
+   */
+  private async logExecution(call: ToolCall, res: ToolResult): Promise<void> {
+    if (!this._workspace) return;
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      tool: call.name,
+      call_id: call.call_id,
+      args: call.args,
+      ok: res.ok,
+      output: res.ok ? (res.output as string) : (res.error as string),
+    });
+    await appendLineLocked(this._workspace.file("run.log"), line);
+  }
+
+  /**
    * Gestão de contexto (§B): com `summarizer` configurado, o prefixo antigo
    * (tudo antes das últimas `summarizeKeepRecent` mensagens) é condensado em um
    * único item de sistema. Falha ou resumo vazio caem na poda determinística.
@@ -620,6 +678,7 @@ export class ReAct {
     const signal = this._ac.signal;
     this._state = "running";
     this._pendingApproval = null;
+    this._workspace = null;
     this._messages.push(this.toUserItem(prompt));
 
     const finish = (): TExecutionResult => ({
@@ -631,9 +690,15 @@ export class ReAct {
       rounds: this._rounds,
       toolCalls: this._callings,
       summaries: this._summaries,
+      workspace: this._workspace?.path,
     });
 
     try {
+      // Workspace persistente (opt-in): cria o subdiretório do run antes do 1º
+      // round. Falha aqui vira evento `error` (sem artefatos parciais do loop).
+      if (this._workspaceDir) {
+        this._workspace = await createRunWorkspace({ baseDir: this._workspaceDir });
+      }
       for (;;) {
         if (this._rounds >= this._maxRounds) break;
         this._rounds++;
@@ -700,6 +765,23 @@ export class ReAct {
         );
 
         if (outcome.calls.length === 0) break;
+
+        // Execução concorrente (§C paralelo): as tools **não sensíveis** do
+        // round rodam em paralelo (`Promise.all`), os resultados ficam
+        // cacheados por call_id e são aplicados na passada sequencial abaixo —
+        // preservando ordem determinística de eventos, histórico e run log.
+        const plainResults = new Map<string, ToolResult>();
+        if (this._parallelToolCalls && outcome.calls.length > 1) {
+          const plain = outcome.calls.filter(
+            (call) => !this._registry.get(call.name)?.sensitive,
+          );
+          if (plain.length > 1) {
+            const results = await Promise.all(
+              plain.map((call) => this._registry.executeSafe(call.name, call.args)),
+            );
+            plain.forEach((call, i) => plainResults.set(call.call_id, results[i]));
+          }
+        }
 
         for (const call of outcome.calls) {
           const tool = this._registry.get(call.name);
@@ -772,7 +854,8 @@ export class ReAct {
             }
           }
 
-          const res = await this._registry.executeSafe(call.name, call.args);
+          const res = plainResults.get(call.call_id) ??
+            (await this._registry.executeSafe(call.name, call.args));
           const output = res.ok ? (res.output as string) : (res.error as string);
           this._messages.push({
             type: "function_call_output",
@@ -781,6 +864,7 @@ export class ReAct {
           });
           this._callings++;
           this._toolResponseCb?.(call.name, output);
+          await this.logExecution(call, res);
           yield { type: "tool_result", tool: call.name, ok: res.ok, output };
 
           if (!res.ok) {

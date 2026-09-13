@@ -56,7 +56,8 @@ export interface TokenUsage {
  * Resultado consolidado de uma execução completa do agente (spec §3).
  *
  * É o valor de retorno do gerador `ReAct.run()` (ao lado dos eventos). Os
- * campos `rounds`, `toolCalls` e `summaries` são aditivos do harness.
+ * campos `rounds`, `toolCalls`, `summaries` e `workspace` são aditivos do
+ * harness.
  *
  * @example
  * ```ts
@@ -69,6 +70,7 @@ export interface TokenUsage {
  *   rounds: 2,
  *   toolCalls: 3,
  *   summaries: 1,
+ *   workspace: "/tmp/agentcore/run-1a2b3c", // quando workspaceDir está ativo
  * };
  * ```
  */
@@ -89,6 +91,8 @@ export interface TExecutionResult {
   toolCalls: number;
   /** Quantas vezes o histórico foi condensado por LLM (§B). */
   summaries: number;
+  /** Caminho do workspace do run (run log), quando `workspaceDir` está ativo. */
+  workspace?: string;
 }
 
 /**

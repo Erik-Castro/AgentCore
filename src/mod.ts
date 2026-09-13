@@ -48,6 +48,7 @@ export * from "./client.ts";
 export * from "./events.ts";
 export * from "./tools.ts";
 export * from "./tokens.ts";
+export * from "./env.ts";
 export {
   ReAct,
   type ReActOptions,

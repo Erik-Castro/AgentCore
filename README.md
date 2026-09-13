@@ -29,7 +29,8 @@ A `src/` é uma implementação funcional da spec que valida as propostas:
 - **`ReAct.run(prompt)`** é um *async generator*: emite `AgentEvent` em tempo real (raciocínio, conteúdo, chamadas de tool) e retorna `TExecutionResult` (uso de tokens, tempo, rounds, calls).
 - **Self-healing (§C)**: falha de tool (JSON inválido, schema violado, tool desconhecida) nunca quebra o agente — o erro volta ao contexto como mensagem de sistema e o modelo tenta de novo.
 - **Gestão de contexto (§B)**: limites determinísticos de itens/caracteres impedem contexto infinito; **opt-in** para condensar o histórico antigo por LLM (`ReActOptions.summarizer`) mantendo as últimas interações intactas, com a poda determinística como *safety net*. **Trigger por tokens** (`maxContextTokens`): usa o `usage.input_tokens` real do provider (fallback: estimativa `~4 chars/token` injetável) e dispara aos ~80% da janela (`contextTokenRatio`).
-- **HITL (§D)**: tools marcadas `sensitive: true` pausam o agente (`state === "paused"`) emitindo `tool_interrupt`; a decisão chega via `resume(true|false)`. Com `approvalTimeoutMs` configurado, a decisão expira sozinha (`tool_denied` com `reason: "timeout"`) — consumidor sumido não trava o agente. `resume(true, params)` aprova com parâmetros ajustados (override revalidado pelo schema).
+- **Paralelismo orquestrado (§C)**: request leva `parallel_tool_calls` (default `true`); tools **não sensíveis** de um round rodam em lote (`Promise.all`), resultados cacheados por `call_id` e aplicados na **passada sequencial** — ordem/eventos determinísticos por construção, não por `flock`. Sensitive/HITL seguem sequenciais (§D). (**Gotcha validado por probe neste runtime**: `Deno.open({ lock:true })` **não** serializa duas aberturas do mesmo arquivo dentro do mesmo processo — o flock é *advisory*/best-effort entre processos. A ordem determinística vem do harness, não do lock.)
+- **Workspace persistente (§E)**: opcional `ReActOptions.workspaceDir` — cada `run()` cria subdir efêmero `0o700` (`src/env.ts`: `createWorkspace`/`createRunWorkspace`/`withFileLock`/`appendLineLocked`) e grava `run.log` (JSON por linha, com flock + newline) registrando cada execução de ferramenta; o caminho do workspace sai como `TExecutionResult.workspace`. Offline: os testes de FS usam workspaces reais (`src/env_test.ts`, offline) e recursos nativos (`Deno.makeTempDir({mode})`, flock).
 - **Validação por Zod**: `Tool.parameters` é um schema Zod (v4) tipado — o `executeSafe` valida com `safeParse`, o `toOpenAITool` converte para JSON Schema via `z.toJSONSchema()` e o `loadRuntimeConfig` também valida o env (coercion, trim e `http/https`).
 - **`cancel()`** (AbortController) e **`reset()`** para lifecycle gracioso.
 - **Provider injetável**: os testes rodam 100% offline com um provider fake, sem rede.
@@ -96,7 +97,7 @@ const agent = new ReAct(
 ```bash
 deno task dev       # demo interativa contra o Ollama local (main.ts)
 deno task check     # typecheck de main.ts + mod.ts + src/mod.ts
-deno task test      # suíte offline (52 testes): eventos, tools, loop ReAct, tokens, config e summarizer
+deno task test      # suíte offline (56 testes): eventos, tools, loop ReAct, tokens, config e summarizer
 deno task test:int  # integração E2E contra o Ollama local (precisa servidor + modelo)
 ```
 

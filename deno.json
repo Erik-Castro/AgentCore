@@ -7,7 +7,7 @@
   "tasks": {
     "dev": "deno run --allow-net --allow-env --watch main.ts",
     "check": "deno check main.ts mod.ts src/mod.ts",
-    "test": "deno test src/",
+    "test": "deno test --allow-read --allow-write --allow-env src/",
     "test:int": "deno test --allow-net=localhost:11434 --allow-env tests/integration/"
   },
   "imports": {
